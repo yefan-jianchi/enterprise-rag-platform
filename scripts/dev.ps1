@@ -16,6 +16,13 @@
 #      下会被包装成 NativeCommandError 直接中断脚本；光加 2>$null 挡不住，
 #      必须临时把 EAP 降成 Continue。
 #   3) 启动后不要用固定 Start-Sleep 猜时间，要**轮询端口**直到就绪。
+#   4) 【重要】前端跑着的时候，不要在项目里执行会重写工作区的 git 命令
+#      （git rebase / checkout / reset --hard / pull）。Vite 会监听 vite.config.js，
+#      文件被重写的瞬间它会重启并「加载配置失败」，然后退回"无配置"状态，表现为：
+#        · @ 别名失效（Failed to resolve import "@/..."）
+#        · .vue 报 "Install @vitejs/plugin-vue to handle .vue files"
+#        · 启动日志里 host 变回 localhost，并出现 "Could not auto-determine entry point"
+#      配置本身没坏，**重启 Vite 即可恢复**（先删 node_modules\.vite 更稳）。
 # ============================================================
 param(
   [ValidateSet('all', 'db', 'ai', 'backend', 'frontend')]
