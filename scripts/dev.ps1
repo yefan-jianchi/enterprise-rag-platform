@@ -6,12 +6,23 @@
 #  用法：
 #      powershell -ExecutionPolicy Bypass -File .\scripts\dev.ps1
 #      powershell -ExecutionPolicy Bypass -File .\scripts\dev.ps1 -Only ai
+#
+#  ⚠ 踩过的坑（改这个脚本前务必看）：
+#   1) 用 Start-Process -RedirectStandardOutput 启长驻进程时，
+#      **父 shell 退出会等重定向句柄，导致脚本挂住不返回**。
+#      所以这里统一改成 `cmd /c "... > log 2>&1"`，让 cmd 做重定向，
+#      PowerShell 侧不持有任何句柄。
+#   2) mysql 客户端的密码警告写 stderr，在 $ErrorActionPreference='Stop'
+#      下会被包装成 NativeCommandError 直接中断脚本；光加 2>$null 挡不住，
+#      必须临时把 EAP 降成 Continue。
+#   3) 启动后不要用固定 Start-Sleep 猜时间，要**轮询端口**直到就绪。
 # ============================================================
 param(
   [ValidateSet('all', 'db', 'ai', 'backend', 'frontend')]
   [string]$Only = 'all',
   [string]$MysqlUser = 'root',
-  [string]$MysqlPassword = '123456'
+  [string]$MysqlPassword = '123456',
+  [int]$WaitSeconds = 120
 )
 
 $ErrorActionPreference = 'Stop'
@@ -20,20 +31,51 @@ $LogDir = Join-Path $Root 'logs'
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
 # ---------- 便携工具链（本机没有全局 Java/Node）----------
-$JdkHome = Join-Path $Root 'tools\jdk-21'
-$NodeDir = Join-Path $Root 'tools\node'
+$JdkHome  = Join-Path $Root 'tools\jdk-21'
+$NodeDir  = Join-Path $Root 'tools\node'
+$GitDir   = Join-Path $Root 'tools\git\cmd'
 $MavenBin = 'D:\操做系统\apache-maven\apache-maven-3.8.4\bin'
-$Python = 'C:\python\python.exe'
+$Python   = 'C:\python\python.exe'
 
-if (Test-Path $JdkHome) { $env:JAVA_HOME = $JdkHome }
+if (Test-Path $JdkHome) { $env:JAVA_HOME = $JdkHome; $env:PATH = "$JdkHome\bin;" + $env:PATH }
 if (Test-Path $NodeDir) { $env:PATH = "$NodeDir;" + $env:PATH }
+if (Test-Path $GitDir)  { $env:PATH = "$GitDir;"  + $env:PATH }
 if (Test-Path $MavenBin) { $env:PATH = "$MavenBin;" + $env:PATH }
-if (Test-Path $JdkHome) { $env:PATH = "$JdkHome\bin;" + $env:PATH }
 $env:PYTHONIOENCODING = 'utf-8'
 
 function Write-Step($msg) { Write-Host "[$(Get-Date -Format 'HH:mm:ss')] $msg" -ForegroundColor Cyan }
 function Test-Port($port) {
-  return [bool](Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)
+  # 双重判活：Get-NetTCPConnection 偶尔看不到某些绑定，再用 TCP 连接兜底
+  if (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) { return $true }
+  try {
+    $c = New-Object System.Net.Sockets.TcpClient
+    $c.Connect('127.0.0.1', $port)
+    $ok = $c.Connected
+    $c.Close()
+    return $ok
+  } catch { return $false }
+}
+function Wait-Port($port, $seconds, $name) {
+  $deadline = (Get-Date).AddSeconds($seconds)
+  while ((Get-Date) -lt $deadline) {
+    if (Test-Port $port) { return $true }
+    Start-Sleep -Seconds 2
+  }
+  return $false
+}
+# 用 cmd 做重定向启动，避免父进程持有句柄
+# ⚠ 实测坑（四种写法对比过）：**绝对不要给命令名加引号**。
+#     cmd /c "npm" run dev        → 子进程立刻退出、日志为空（失败）
+#     cmd /c npm run dev          → 正常（成功）
+#     cmd /c C:\...\npm.cmd run dev → 正常（成功）
+#     cmd /c "C:\...\npm.cmd" run dev → 失败
+#   正确做法：整条命令作为一个参数传给 /c，由 PowerShell 加外层引号。
+function Start-Detached($exe, $arguments, $workDir, $outLog) {
+  if ($exe -match '\s') {
+    Write-Host "  ⚠ 路径含空格（$exe），cmd /c 的引号解析容易出问题，建议换到无空格路径" -ForegroundColor Yellow
+  }
+  $cmd = "$exe $arguments > `"$outLog`" 2>&1"
+  Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', $cmd -WorkingDirectory $workDir -WindowStyle Hidden | Out-Null
 }
 
 Write-Host ''
@@ -49,19 +91,13 @@ if ($Only -in 'all', 'db') {
   } else {
     $cli = 'C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe'
     if (Test-Path $cli) {
-      # ⚠ 踩过的坑：mysql 客户端会把「Using a password on the command line is insecure」
-      # 这种警告写到 stderr，PowerShell 5.1 在 $ErrorActionPreference='Stop' 下会把它
-      # 包装成 NativeCommandError 并**直接中断脚本** —— 光写 2>$null 也挡不住。
-      # 正确做法：临时把 EAP 降成 Continue，再用 try/catch + 2>$null 吞掉。
       $eap = $ErrorActionPreference
       $ErrorActionPreference = 'Continue'
       $exists = ''
       try {
         $exists = (& $cli -u $MysqlUser "-p$MysqlPassword" -N `
                     -e "select count(*) from information_schema.schemata where schema_name='rag_platform';" 2>$null)
-      } catch {
-        $exists = ''
-      }
+      } catch { $exists = '' }
       $ErrorActionPreference = $eap
       $exists = ("$exists").Trim()
       if ($exists -ne '1') {
@@ -82,15 +118,13 @@ if ($Only -in 'all', 'ai') {
     Write-Host '  AI 服务已在 8001 运行，跳过' -ForegroundColor DarkGray
   } else {
     Write-Step '启动 AI 服务 (Python + LangChain + FAISS) ...'
-    $aiDir = Join-Path $Root 'ai-service'
-    Start-Process -FilePath $Python `
-      -ArgumentList '-m', 'uvicorn', 'app.main:app', '--host', '0.0.0.0', '--port', '8001' `
-      -WorkingDirectory $aiDir -WindowStyle Hidden `
-      -RedirectStandardOutput (Join-Path $LogDir 'ai-service.out.log') `
-      -RedirectStandardError  (Join-Path $LogDir 'ai-service.err.log') | Out-Null
-    Start-Sleep -Seconds 4
-    if (Test-Port 8001) { Write-Host '  AI 服务已就绪： http://localhost:8001/docs' -ForegroundColor Green }
-    else { Write-Host '  AI 服务启动失败，看 logs\ai-service.err.log' -ForegroundColor Red }
+    Start-Detached $Python '-m uvicorn app.main:app --host 0.0.0.0 --port 8001' `
+      (Join-Path $Root 'ai-service') (Join-Path $LogDir 'ai-service.out.log')
+    if (Wait-Port 8001 60 'AI 服务') {
+      Write-Host '  AI 服务已就绪： http://localhost:8001/docs' -ForegroundColor Green
+    } else {
+      Write-Host '  AI 服务启动失败，看 logs\ai-service.out.log' -ForegroundColor Red
+    }
   }
 }
 
@@ -99,26 +133,26 @@ if ($Only -in 'all', 'backend') {
   if (Test-Port 8080) {
     Write-Host '  后端已在 8080 运行，跳过' -ForegroundColor DarkGray
   } else {
-    Write-Step '启动后端 (Spring Boot 3 + Java 21) ...'
+    Write-Step '启动后端 (Spring Boot + Java 21) ...'
     $backendDir = Join-Path $Root 'backend'
-    $jar = Get-ChildItem (Join-Path $backendDir 'target') -Filter '*.jar' -ErrorAction SilentlyContinue |
-           Where-Object { $_.Name -notmatch 'sources|javadoc|original' } | Select-Object -First 1
+    # 只用明确的 jar 名，避免 sources/javadoc/备份副本被 Select-Object -First 1 选错
+    $jar = Get-ChildItem (Join-Path $backendDir 'target') -Filter 'enterprise-rag-backend*.jar' -ErrorAction SilentlyContinue |
+           Where-Object { $_.Name -notmatch 'sources|javadoc|original|\.bak|good' } | Select-Object -First 1
     if ($jar) {
-      Write-Host "  使用已打包的 $($jar.Name)" -ForegroundColor DarkGray
-      Start-Process -FilePath (Join-Path $JdkHome 'bin\java.exe') `
-        -ArgumentList '-jar', $jar.FullName, '--spring.profiles.active=dev' `
-        -WorkingDirectory $backendDir -WindowStyle Hidden `
-        -RedirectStandardOutput (Join-Path $LogDir 'backend.out.log') `
-        -RedirectStandardError  (Join-Path $LogDir 'backend.err.log') | Out-Null
+      Write-Host "  使用已打包的 $($jar.Name)（$([math]::Round($jar.Length/1MB)) MB）" -ForegroundColor DarkGray
+      Start-Detached (Join-Path $JdkHome 'bin\java.exe') `
+        "-Dfile.encoding=UTF-8 -jar `"$($jar.FullName)`" --spring.profiles.active=dev" `
+        $backendDir (Join-Path $LogDir 'backend.out.log')
     } else {
       Write-Host '  未找到 jar，改用 mvn spring-boot:run（首次会下载依赖，较慢）' -ForegroundColor DarkGray
-      Start-Process -FilePath 'cmd.exe' `
-        -ArgumentList '/c', "mvn spring-boot:run -Dspring-boot.run.profiles=dev > `"$LogDir\backend.out.log`" 2>&1" `
-        -WorkingDirectory $backendDir -WindowStyle Hidden | Out-Null
+      Start-Detached 'mvn' 'spring-boot:run -Dspring-boot.run.profiles=dev' `
+        $backendDir (Join-Path $LogDir 'backend.out.log')
     }
-    Start-Sleep -Seconds 15
-    if (Test-Port 8080) { Write-Host '  后端已就绪： http://localhost:8080' -ForegroundColor Green }
-    else { Write-Host '  后端可能还在启动中，看 logs\backend.out.log' -ForegroundColor Yellow }
+    if (Wait-Port 8080 $WaitSeconds '后端') {
+      Write-Host '  后端已就绪： http://localhost:8080' -ForegroundColor Green
+    } else {
+      Write-Host "  后端在 $WaitSeconds 秒内未就绪，看 logs\backend.out.log" -ForegroundColor Yellow
+    }
   }
 }
 
@@ -132,15 +166,18 @@ if ($Only -in 'all', 'frontend') {
       Write-Step '启动前端 (Vue3 + Vite) ...'
       if (-not (Test-Path (Join-Path $feDir 'node_modules'))) {
         Write-Host '  首次启动，先 npm install ...' -ForegroundColor DarkGray
-        Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', 'npm install --registry=https://registry.npmmirror.com' `
-          -WorkingDirectory $feDir -WindowStyle Hidden -Wait
+        Start-Detached "$NodeDir\npm.cmd" 'install --registry=https://registry.npmmirror.com' $feDir (Join-Path $LogDir 'npm-install.log')
+        while (-not (Test-Path (Join-Path $feDir 'node_modules'))) {
+          Start-Sleep -Seconds 5
+          Write-Host '    ... npm install 进行中' -ForegroundColor DarkGray
+        }
       }
-      Start-Process -FilePath 'cmd.exe' `
-        -ArgumentList '/c', "npm run dev > `"$LogDir\frontend.out.log`" 2>&1" `
-        -WorkingDirectory $feDir -WindowStyle Hidden | Out-Null
-      Start-Sleep -Seconds 8
-      if (Test-Port 5173) { Write-Host '  前端已就绪： http://localhost:5173' -ForegroundColor Green }
-      else { Write-Host '  前端启动失败，看 logs\frontend.out.log' -ForegroundColor Red }
+      Start-Detached "$NodeDir\npm.cmd" 'run dev' $feDir (Join-Path $LogDir 'frontend.out.log')
+      if (Wait-Port 5173 60 '前端') {
+        Write-Host '  前端已就绪： http://localhost:5173' -ForegroundColor Green
+      } else {
+        Write-Host '  前端启动失败，看 logs\frontend.out.log' -ForegroundColor Red
+      }
     } else {
       Write-Host '  前端目录还没有 package.json，跳过' -ForegroundColor DarkGray
     }
@@ -156,4 +193,5 @@ Write-Host '    AI 接口文档 http://localhost:8001/docs'
 Write-Host ''
 Write-Host "  日志目录    $LogDir"
 Write-Host '  停止服务    powershell -File .\scripts\stop-dev.ps1'
+Write-Host '  全链路验收  powershell -File .\scripts\smoke-test.ps1'
 Write-Host '------------------------------------------------------------'
