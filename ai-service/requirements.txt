@@ -1,0 +1,32 @@
+# ============================================================
+#  AI 服务依赖（Python 3.10+，本机 3.12 验证通过）
+#  安装： pip install -r requirements.txt
+#  国内加速： pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+# ============================================================
+
+# --- Web 框架 ---
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9          # 文件上传（/documents/upload）
+
+# --- 配置与校验 ---
+pydantic>=2.6.0
+pydantic-settings>=2.2.0
+
+# --- 文档解析 ---
+pypdf>=4.0.0                     # PDF 逐页解析（保留页码）
+python-docx>=1.1.0               # Word 段落 + 表格
+
+# --- 向量与检索 ---
+numpy>=1.26.0
+faiss-cpu>=1.7.4                 # 向量索引（IndexFlatIP + IndexIDMap2）
+jieba>=0.42.1                    # 中文分词
+rank-bm25>=0.2.2                 # 仅作对照，项目内自带 BM25 实现
+
+# --- 模型调用 ---
+httpx>=0.27.0                    # 调 OpenAI 兼容接口（含 SSE 流式）
+
+# --- LangChain（用于 Agent / Tool Calling 编排，可选）---
+langchain>=0.2.0
+langchain-openai>=0.1.0
+langchain-core>=0.2.0

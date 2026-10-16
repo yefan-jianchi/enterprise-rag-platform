@@ -1,0 +1,184 @@
+# ============================================================================
+#  企业级多模型 RAG 知识库与智能客服平台 —— 后端主配置
+#
+#  设计原则：这里只放「与运行环境无关」的稳定配置；
+#  凡是本机 / Docker 会不一样的（缓存、对象存储、数据库地址），
+#  一律走 profile 覆盖（application-dev.yml / 环境变量），
+#  这样同一份构建产物既能本机裸跑，也能进 Docker。
+# ============================================================================
+server:
+  port: 8080
+  # SSE 长连接：不要让 Tomcat 默认的 connectionTimeout 把流掐掉
+  tomcat:
+    connection-timeout: 300s
+  compression:
+    enabled: false   # SSE 不能压缩，否则前端拿不到增量
+
+spring:
+  application:
+    name: enterprise-rag-backend
+  profiles:
+    active: dev
+
+  # ------------------------- 数据源：MySQL 8 -------------------------
+  datasource:
+    url: jdbc:mysql://localhost:3306/rag_platform?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true&rewriteBatchedStatements=true
+    username: root
+    password: "123456"
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      maximum-pool-size: 16
+      minimum-idle: 4
+      connection-timeout: 10000
+      pool-name: RagHikariPool
+
+  # ------------------------- JPA -------------------------
+  jpa:
+    # 表已由 db/schema.sql 建好，绝不让 Hibernate 改结构（update/create 会毁掉种子数据）
+    hibernate:
+      ddl-auto: none
+    open-in-view: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQLDialect
+        format_sql: false
+        jdbc:
+          batch_size: 50
+          time_zone: Asia/Shanghai
+    show-sql: false
+
+  # ------------------------- JSON 序列化 -------------------------
+  jackson:
+    time-zone: GMT+8
+    date-format: yyyy-MM-dd HH:mm:ss
+    default-property-inclusion: always
+    serialization:
+      write-dates-as-timestamps: false
+      fail-on-empty-beans: false
+
+  # ------------------------- 上传限制 -------------------------
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 60MB
+
+  mvc:
+    async:
+      # SSE 异步请求超时（毫秒）：模型流式回答可能较慢，给足 5 分钟
+      request-timeout: 300000
+
+  # ------------------------- Redis（可切换实现） -------------------------
+  # app.cache.type=memory 时不会真正用到 Redis，这里只是把连接参数准备好
+  data:
+    redis:
+      host: ${APP_REDIS_HOST:localhost}
+      port: ${APP_REDIS_PORT:6379}
+      database: 0
+      timeout: 3s
+      lettuce:
+        pool:
+          max-active: 16
+          max-idle: 8
+          min-idle: 0
+
+# ============================================================================
+#  应用自有配置（app.*）
+# ============================================================================
+app:
+  # ---------------- Python AI 服务（契约已冻结） ----------------
+  ai-service:
+    base-url: http://localhost:8001
+    # 单次调用超时；/rag/ask、/index/build 可能较慢
+    connect-timeout-ms: 5000
+    read-timeout-ms: 180000
+    # 启动时是否探活（探活失败只打警告，不阻断启动）
+    health-check-on-startup: true
+
+  # ---------------- 缓存：memory（本机默认） / redis ----------------
+  cache:
+    type: memory
+    # memory 实现的兜底 key 数量上限，防止无界增长
+    memory-max-size: 10000
+    default-ttl-seconds: 300
+
+  # ---------------- 对象存储：local（本机默认） / minio ----------------
+  storage:
+    type: local
+    # local 实现的根目录（相对路径按进程工作目录解析）
+    local-dir: ./data/files
+    minio:
+      endpoint: ${APP_MINIO_ENDPOINT:http://localhost:9000}
+      access-key: ${APP_MINIO_ACCESS_KEY:minioadmin}
+      secret-key: ${APP_MINIO_SECRET_KEY:minioadmin}
+      bucket: ${APP_MINIO_BUCKET:rag-platform}
+
+  # ---------------- JWT ----------------
+  jwt:
+    # 至少 32 字符：HS256 要求密钥长度 >= 256 bit
+    secret: ${APP_JWT_SECRET:yit-enterprise-rag-platform-jwt-secret-key-2026-please-change-me}
+    expire-minutes: 720
+    header: Authorization
+    prefix: "Bearer "
+
+  # ---------------- 安全管理员引导 ----------------
+  bootstrap:
+    enabled: true
+    tenant-code: demo
+    username: admin
+    password: admin123
+    nickname: 系统管理员
+
+  # ---------------- AES 加解密（api_key_cipher） ----------------
+  crypto:
+    # 16/24/32 字节的 AES 密钥（这里 32 字符 = AES-256）
+    aes-key: ${APP_AES_KEY:yit-rag-aes-key-2026-0123456789ab}
+    # 生产环境必须用环境变量覆盖，禁止把真实 Key 写进仓库
+
+  # ---------------- 模型单价（元 / 千 token），用于 ai_call_log.cost_yuan 折算 ----------------
+  # 结构：app.model-price.<provider_code>.prompt / .completion，default 为兜底
+  model-price:
+    default:
+      prompt: 0.0010
+      completion: 0.0020
+    deepseek:
+      prompt: 0.0010
+      completion: 0.0020
+    dashscope:
+      prompt: 0.0008
+      completion: 0.0020
+    openai:
+      prompt: 0.0011
+      completion: 0.0044
+    mock:
+      prompt: 0.0000
+      completion: 0.0000
+
+  # ---------------- 业务参数 ----------------
+  rag:
+    default-top-k: 5
+    default-strategy: HYBRID_RERANK
+    # 文档处理失败时的重试次数
+    process-max-retry: 1
+
+# ============================================================================
+#  日志
+# ============================================================================
+logging:
+  level:
+    root: INFO
+    com.yit.rag: DEBUG
+    org.hibernate.SQL: WARN
+    org.springframework.security: INFO
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n"
+
+# ============================================================================
+#  OpenAPI
+# ============================================================================
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    tags-sorter: alpha
+    operations-sorter: alpha

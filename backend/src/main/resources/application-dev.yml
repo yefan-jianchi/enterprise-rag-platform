@@ -1,0 +1,31 @@
+# ============================================================================
+#  dev profile —— 本机开发环境
+#
+#  本机只有 MySQL，没有 Redis、没有 MinIO，所以这里显式把两个可替换组件
+#  切成「纯 Java / 本地磁盘」实现：
+#      app.cache.type   = memory
+#      app.storage.type = local
+#  Docker 里通过环境变量 APP_CACHE_TYPE=redis / APP_STORAGE_TYPE=minio 切走，
+#  业务代码一行都不用改。
+# ============================================================================
+app:
+  cache:
+    type: memory       # 内存 Map + TTL，无外部依赖
+
+  storage:
+    type: local
+    # 注意：这里刻意不用 ./data/files 相对路径。
+    # 原因：AI 服务底层用 FAISS，而 FAISS 在 Windows 上用 ANSI 打开文件，
+    #       项目位于「桌面\项目\」这种含中文的路径下会导致建索引失败。
+    #       所以本地文件落到 LOCALAPPDATA（纯 ASCII 路径），AI 服务读得到。
+    local-dir: ${LOCALAPPDATA:${java.io.tmpdir}}/enterprise-rag-platform/uploads
+
+  ai-service:
+    base-url: http://localhost:8001
+    health-check-on-startup: true
+
+logging:
+  level:
+    com.yit.rag: DEBUG
+    # 打开可以看到完整的请求/响应与 SQL 参数，排错用
+    org.hibernate.orm.jdbc.bind: WARN

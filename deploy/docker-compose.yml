@@ -1,0 +1,184 @@
+# ============================================================================
+#  企业级多模型 RAG 知识库与智能客服平台 —— 一键部署编排
+#
+#  启动：  cd deploy && cp .env.example .env && docker compose up -d --build
+#  访问：  http://localhost          （前端，经 Nginx 反代）
+#          http://localhost:8001/docs（AI 服务接口文档，直连）
+#          http://localhost:9001     （MinIO 控制台，账号见 .env）
+#
+#  六个容器：mysql / redis / minio / ai-service / backend / frontend / gateway
+#  依赖顺序用 healthcheck + depends_on 的 condition 保证，
+#  避免「后端先起来但 MySQL 还没初始化完」这种经典翻车。
+# ============================================================================
+
+name: enterprise-rag-platform
+
+services:
+  # ---------------------------------------------------------------- MySQL
+  mysql:
+    image: mysql:8.0
+    container_name: rag-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-123456}
+      MYSQL_DATABASE: rag_platform
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-authentication-plugin=mysql_native_password
+      - --innodb-buffer-pool-size=512M
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # 首次启动自动执行建表与种子数据（按文件名顺序执行）
+      - ./mysql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_ROOT_PASSWORD:-123456}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    networks: [rag-net]
+
+  # ---------------------------------------------------------------- Redis
+  redis:
+    image: redis:7-alpine
+    container_name: rag-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks: [rag-net]
+
+  # ---------------------------------------------------------------- MinIO
+  minio:
+    image: minio/minio:latest
+    container_name: rag-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [rag-net]
+
+  # ------------------------------------------------------- AI 服务（Python）
+  ai-service:
+    build:
+      context: ../ai-service
+      dockerfile: Dockerfile
+    container_name: rag-ai-service
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8001
+      # 想用真实模型就把 .env 里的 Key 填上，并把下面两个改成 deepseek / dashscope
+      EMBED_PROVIDER: ${EMBED_PROVIDER:-mock}
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # 容器内是纯英文路径，不存在 Windows 中文路径导致 FAISS 打不开的问题
+      DATA_DIR: /app/data
+      TZ: Asia/Shanghai
+    ports:
+      - "${AI_SERVICE_PORT:-8001}:8001"
+    volumes:
+      - ai-data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8001/health',timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 6s
+      retries: 10
+      start_period: 30s
+    networks: [rag-net]
+
+  # ------------------------------------------------------- 后端（Spring Boot）
+  backend:
+    build:
+      context: ..
+      dockerfile: deploy/backend/Dockerfile
+    container_name: rag-backend
+    restart: unless-stopped
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_DATABASE: rag_platform
+      MYSQL_USERNAME: root
+      MYSQL_PASSWORD: ${MYSQL_ROOT_PASSWORD:-123456}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      # 容器内切换成 Redis 缓存 + MinIO 对象存储
+      APP_CACHE_TYPE: redis
+      APP_STORAGE_TYPE: minio
+      APP_AI_SERVICE_BASE_URL: http://ai-service:8001
+      APP_JWT_SECRET: ${JWT_SECRET:-change-me-in-production-please-32chars-min}
+      TZ: Asia/Shanghai
+    ports:
+      - "${BACKEND_PORT:-8080}:8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      ai-service:
+        condition: service_healthy
+    networks: [rag-net]
+
+  # ------------------------------------------------------- 前端（Vue3 静态站）
+  frontend:
+    build:
+      context: ..
+      dockerfile: deploy/frontend/Dockerfile
+    container_name: rag-frontend
+    restart: unless-stopped
+    networks: [rag-net]
+
+  # ------------------------------------------------------- Nginx 统一入口
+  gateway:
+    image: nginx:1.27-alpine
+    container_name: rag-gateway
+    restart: unless-stopped
+    ports:
+      - "${GATEWAY_PORT:-80}:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - backend
+      - frontend
+      - ai-service
+    networks: [rag-net]
+
+volumes:
+  mysql-data:
+  redis-data:
+  minio-data:
+  ai-data:
+
+networks:
+  rag-net:
+    driver: bridge
